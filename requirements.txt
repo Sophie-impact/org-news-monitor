@@ -1,0 +1,7 @@
+requests
+python-dateutil
+pandas
+slack_sdk
+beautifulsoup4
+tldextract
+tzdata
