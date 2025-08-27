@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Daily news monitor: Naver Search API + NewsAPI
-- Reads an organization list from Google Sheets CSV (SHEET_CSV_URL)
-- Fetches latest articles for each org from both sources
-- Simple rule-based "risk sentiment" labeling
-- Posts a formatted summary to Slack
+Daily news monitor: Naver Search API + NewsAPI.org → Slack
+- Google Sheets CSV(SHEET_CSV_URL)에서 '조직명' 열을 읽어 조직 리스트 확보
+- Naver/NewsAPI 양쪽에서 최신 기사 검색
+- 관련성 필터(제목/요약에 조직명 실제 포함), 기간 필터, 중복 제거
+- 규칙 기반 라벨(🔴/🟡/🔵/🟢) 붙여 Slack 채널로 전송
 
-Environment variables required:
+필수 환경변수(Secrets/Variables):
   NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, NEWSAPI_KEY
   SLACK_BOT_TOKEN, SLACK_CHANNEL
   SHEET_CSV_URL
-Optional:
-  MAX_RESULTS_PER_ORG (default: 1)  # number of headlines per org
-  LOOKBACK_HOURS (default: 24)      # time window for recent news
+선택:
+  MAX_RESULTS_PER_ORG (기본 1)
+  LOOKBACK_HOURS (기본 24)
 """
+
 import os
 import re
 import html
@@ -22,7 +23,6 @@ import time
 import logging
 import requests
 import pandas as pd
-import tldextract
 from io import StringIO
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
@@ -30,15 +30,16 @@ from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+import tldextract
 
 KST = ZoneInfo("Asia/Seoul")
 
-# -------- utils --------
+# ---------- 공통 유틸 ----------
 def now_kst():
     return datetime.now(tz=KST)
 
 def parse_datetime(dt_str):
-    """Robust datetime parser (RFC1123, ISO8601). Returns aware UTC dt."""
+    """RFC1123/ISO8601 등 문자열을 tz-aware UTC로 변환."""
     try:
         dt = dtparser.parse(dt_str)
         if dt.tzinfo is None:
@@ -58,7 +59,6 @@ def strip_html(text):
 
 def domain_from_url(url):
     try:
-        import tldextract
         ext = tldextract.extract(url)
         parts = [p for p in [ext.domain, ext.suffix] if p]
         return ".".join(parts) if parts else ""
@@ -72,33 +72,38 @@ def norm_title(t):
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-# -------- org list --------
+# ---------- 조직 리스트 ----------
 def fetch_org_list():
     sheet_url = os.environ.get("SHEET_CSV_URL", "").strip()
     if not sheet_url:
         raise RuntimeError("SHEET_CSV_URL env var is not set.")
     resp = requests.get(sheet_url, timeout=30)
     resp.raise_for_status()
-    df = pd.read_csv(StringIO(resp.text))
-    if df.shape[1] == 0:
-        raise RuntimeError("CSV has no columns.")
-    # prefer a column named 'org' or '조직명' else first column
-    col = None
-    for cand in ["org", "Org", "ORG", "조직명"]:
-        if cand in df.columns:
-            col = cand
-            break
-    if col is None:
-        col = df.columns[0]
-    orgs = [str(x).strip() for x in df[col].tolist() if str(x).strip() and str(x).strip().lower() != "nan"]
-    # dedup while preserving order
-    seen = set(); uniq = []
+
+    # 🔧 문자깨짐 방지: bytes → UTF-8 강제 디코드
+    csv_text = resp.content.decode("utf-8", errors="replace")
+    df = pd.read_csv(StringIO(csv_text))
+
+    # 안전장치: 반드시 '조직명' 열에서 읽기
+    if "조직명" not in df.columns:
+        raise RuntimeError("CSV에 '조직명' 열이 필요합니다. 시트 첫 번째 헤더를 '조직명'으로 바꿔주세요.")
+
+    orgs = [
+        str(x).strip()
+        for x in df["조직명"].tolist()
+        if str(x).strip() and str(x).strip().lower() != "nan"
+    ]
+
+    # 중복 제거(순서 보존)
+    seen = set()
+    uniq = []
     for o in orgs:
         if o not in seen:
-            uniq.append(o); seen.add(o)
+            uniq.append(o)
+            seen.add(o)
     return uniq
 
-# -------- Naver News Search --------
+# ---------- 네이버 뉴스 검색 ----------
 def search_naver(org, display=5):
     cid = os.environ.get("NAVER_CLIENT_ID", "")
     csec = os.environ.get("NAVER_CLIENT_SECRET", "")
@@ -107,17 +112,12 @@ def search_naver(org, display=5):
         return []
     endpoint = "https://openapi.naver.com/v1/search/news.json"
     headers = {"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec}
-    params = {
-        "query": f"\"{org}\"",
-        "display": display,
-        "start": 1,
-        "sort": "date",
-    }
+    params = {"query": f"\"{org}\"", "display": display, "start": 1, "sort": "date"}
+
     try:
         r = requests.get(endpoint, headers=headers, params=params, timeout=20)
         r.raise_for_status()
-        data = r.json()
-        items = data.get("items", [])
+        items = r.json().get("items", [])
         results = []
         for it in items:
             title = strip_html(it.get("title"))
@@ -140,7 +140,7 @@ def search_naver(org, display=5):
         logging.exception("Naver search failed for %s: %s", org, e)
         return []
 
-# -------- NewsAPI --------
+# ---------- NewsAPI ----------
 def search_newsapi(org, page_size=5, lookback_hours=24, language="ko"):
     key = os.environ.get("NEWSAPI_KEY", "")
     if not key:
@@ -151,18 +151,18 @@ def search_newsapi(org, page_size=5, lookback_hours=24, language="ko"):
     frm = to_utc - timedelta(hours=lookback_hours)
     params = {
         "q": f"\"{org}\"",
-        "from": frm.isoformat().replace("+00:00","Z"),
-        "to": to_utc.isoformat().replace("+00:00","Z"),
+        "from": frm.isoformat().replace("+00:00", "Z"),
+        "to": to_utc.isoformat().replace("+00:00", "Z"),
         "sortBy": "publishedAt",
         "pageSize": page_size,
-        "language": language,
+        "language": language,  # 필요시 'en' 등으로 확장
         "apiKey": key,
     }
+
     try:
         r = requests.get(endpoint, params=params, timeout=20)
         r.raise_for_status()
-        data = r.json()
-        arts = data.get("articles", [])
+        arts = r.json().get("articles", [])
         results = []
         for a in arts:
             title = strip_html(a.get("title"))
@@ -185,7 +185,7 @@ def search_newsapi(org, page_size=5, lookback_hours=24, language="ko"):
         logging.exception("NewsAPI search failed for %s: %s", org, e)
         return []
 
-# -------- sentiment / risk labeling --------
+# ---------- 라벨 규칙 ----------
 NEG_KW = [
     "횡령","배임","사기","고발","기소","구속","수사","압수수색","소송","고소","분쟁","리콜","결함",
     "징계","제재","벌금","과징금","부실","파산","부도","중단","연기","오염","사망","부상","폭발","화재",
@@ -200,7 +200,7 @@ WATCH_KW = [
 POS_KW = [
     "투자유치","시리즈","라운드","유치","유치 성공","수상","선정","최우수","혁신","신기록","최대",
     "상승","증가","호조","호재","확대","진출","오픈","출시","공개","협력","파트너십","MOU","계약",
-    "수주","달성","달성했다","달성해","선보여","개최","성과","매출 성장","흑자","흑자전환","수익성 개선"
+    "수주","달성","개최","성과","매출 성장","흑자","흑자전환","수익성 개선"
 ]
 
 def label_sentiment(title, summary):
@@ -218,10 +218,19 @@ def label_sentiment(title, summary):
         return "🔵"
     return "🟢"
 
-# -------- Slack --------
+# ---------- 오탐(비관련) 필터 ----------
+def is_relevant(org, title, summary):
+    """
+    제목/요약에 조직명이 실제로 포함되어 있는지 확인.
+    (SEE:NEAR 같은 오탐 줄이기)
+    """
+    text = f"{title} {summary}".lower()
+    return org.lower() in text
+
+# ---------- Slack ----------
 def post_to_slack(lines):
     token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
-    channel = os.environ.get("SLACK_CHANNEL", "").strip()  # '#news-monitor' or channel ID 'C...'
+    channel = os.environ.get("SLACK_CHANNEL", "").strip()  # '#news-monitor' 또는 'C...'
     if not token or not channel:
         raise RuntimeError("SLACK_BOT_TOKEN or SLACK_CHANNEL missing.")
     client = WebClient(token=token)
@@ -231,54 +240,64 @@ def post_to_slack(lines):
     except SlackApiError as e:
         raise RuntimeError(f"Slack API error: {e.response.get('error')}")
 
-# -------- main flow --------
+# ---------- main ----------
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     lookback = int(os.environ.get("LOOKBACK_HOURS", "24"))
     max_per_org = int(os.environ.get("MAX_RESULTS_PER_ORG", "1"))
-    # 1) organizations
+
     orgs = fetch_org_list()
     logging.info("Loaded %d organizations.", len(orgs))
 
     all_lines = []
     for idx, org in enumerate(orgs, start=1):
         logging.info("(%d/%d) Searching: %s", idx, len(orgs), org)
+
         naver_items = search_naver(org, display=max(3, max_per_org*2))
-        time.sleep(0.25)  # be polite
+        time.sleep(0.25)  # polite
         newsapi_items = search_newsapi(org, page_size=max(3, max_per_org*2), lookback_hours=lookback, language="ko")
+
         items = naver_items + newsapi_items
 
-        # filter by time window
-        cutoff = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(hours=lookback)
-        items_recent = [it for it in items if (it["published_at"] is None or it["published_at"] >= cutoff)]
-        items = items_recent or items  # fallback if none recent
+        # 1) 관련성 필터: 제목/요약에 조직명이 실제 포함된 기사만
+        items = [it for it in items if is_relevant(it["org"], it["title"], it.get("summary", ""))]
 
-        # sort by published_at desc
+        # 2) 기간 필터(엄격): 날짜 있는 기사만 lookback 내 우선
+        cutoff = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(hours=lookback)
+        items_recent = [it for it in items if (it["published_at"] is not None and it["published_at"] >= cutoff)]
+        if items_recent:
+            items = items_recent
+        else:
+            # 최근 기사 전무 시에만 날짜 없는 것 중 상위 몇 개 허용
+            items = [it for it in items if it["published_at"] is None][:max_per_org*2]
+
+        # 3) 최신순 정렬
         items.sort(key=lambda x: x["published_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
 
-        # de-dup by normalized title + domain
-        seen_keys = set()
+        # 4) 중복 제거(정규화된 제목 + 도메인)
+        seen = set()
         uniq = []
         for it in items:
             key = (norm_title(it["title"]), domain_from_url(it["url"]))
-            if key not in seen_keys and it["url"]:
-                uniq.append(it); seen_keys.add(key)
+            if key not in seen and it["url"]:
+                uniq.append(it); seen.add(key)
 
-        # take top N per org
+        # 5) 조직당 상위 N개 선택
         take = uniq[:max_per_org]
 
         for art in take:
             label = label_sentiment(art["title"], art.get("summary",""))
             src = art["source"]
             when_str = to_kst_str(art["published_at"] or now_kst())
+            # Slack 링크 포맷: <url|text>
             line = f"[{art['org']}] <{art['url']}|{art['title']}> ({src})({when_str}) [{label}]"
             all_lines.append(line)
 
     if not all_lines:
         all_lines.append("오늘은 신규로 감지된 기사가 없습니다.")
 
-    # group message
     post_to_slack(all_lines)
+    logging.info("Posted %d lines to Slack.", len(all_lines))
 
 if __name__ == "__main__":
     main()
