@@ -1,0 +1,35 @@
+name: Daily News Monitor
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 00:00 UTC = 09:00 KST daily
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL }}
+          SHEET_CSV_URL: ${{ vars.SHEET_CSV_URL }}
+          MAX_RESULTS_PER_ORG: ${{ vars.MAX_RESULTS_PER_ORG }}
+          LOOKBACK_HOURS: ${{ vars.LOOKBACK_HOURS }}
+        run: python news_monitor.py
