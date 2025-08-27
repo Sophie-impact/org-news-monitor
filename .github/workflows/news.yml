@@ -32,4 +32,6 @@ jobs:
           SHEET_CSV_URL: ${{ vars.SHEET_CSV_URL }}
           MAX_RESULTS_PER_ORG: ${{ vars.MAX_RESULTS_PER_ORG }}
           LOOKBACK_HOURS: ${{ vars.LOOKBACK_HOURS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}    # ✅ 추가
+          LLM_ENABLE: ${{ vars.LLM_ENABLE }}               # ✅ (옵션) 켜고 끄기용
         run: python news_monitor.py
