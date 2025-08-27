@@ -5,3 +5,4 @@ slack_sdk
 beautifulsoup4
 tldextract
 tzdata
+openai>=1.40.0
