@@ -244,6 +244,11 @@ def post_to_slack(lines):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    # ✅ 토/일이면 아무 것도 하지 않고 종료 (이중 안전장치)
+    if now_kst().weekday() in (5, 6):  # 5=토, 6=일
+        logging.info("Weekend (Sat/Sun) – skipping run.")
+        return
+
     window_from_utc, window_to_utc = compute_window_utc()
     logging.info("Window UTC: %s ~ %s", window_from_utc, window_to_utc)
 
