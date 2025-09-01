@@ -72,37 +72,90 @@ def compute_window_utc(now=None):
     """
     now = now or datetime.now(tz=KST)
     anchor_kst = now.astimezone(KST).replace(hour=9, minute=0, second=0, microsecond=0)
-
     days = 3 if anchor_kst.weekday() == 0 else 1
     start_kst = anchor_kst - timedelta(days=days)
     end_kst = anchor_kst
-
     return start_kst.astimezone(timezone.utc), end_kst.astimezone(timezone.utc)
+
+# ---------- 시트 파싱 유틸 ----------
+def _split_list(val):
+    if pd.isna(val) or str(val).strip() == "":
+        return []
+    return [x.strip().lower() for x in str(val).split(",") if x.strip()]
+
+def _query_tokens_from(q):
+    # "A" OR "B" → ["a","b"] 식으로 토큰화 (따옴표는 제거)
+    if not q:
+        return []
+    parts = re.split(r'\bOR\b', q, flags=re.IGNORECASE)
+    tokens = []
+    for p in parts:
+        t = p.strip().strip('"').strip("'").lower()
+        if t:
+            tokens.append(t)
+    return tokens
 
 # ---------- 시트 읽기 ----------
 def fetch_org_list():
+    """
+    반환: 리스트[{
+      'display': 슬랙에 표시할 이름,
+      'query': 검색어,
+      'kind': 'ORG' | 'PERSON',
+      'must_all': [...], 'must_any': [...], 'block': [...],
+      'query_tokens': [...]
+    }, ...]
+    * 정밀 컬럼이 없어도 동작(기본값 적용)
+    """
     sheet_url = os.environ.get("SHEET_CSV_URL", "").strip()
     if not sheet_url:
         raise RuntimeError("SHEET_CSV_URL env var is not set.")
+
     resp = requests.get(sheet_url, timeout=30)
     resp.raise_for_status()
-
     csv_text = resp.content.decode("utf-8", errors="replace")
     df = pd.read_csv(StringIO(csv_text))
 
-    if "조직명" not in df.columns:
-        raise RuntimeError("CSV에 '조직명' 열이 필요합니다.")
+    # 필수 이름 컬럼: '조직명' 또는 '표시명' 중 하나
+    name_col = None
+    for candidate in ["조직명", "표시명"]:
+        if candidate in df.columns:
+            name_col = candidate
+            break
+    if not name_col:
+        raise RuntimeError("CSV에는 반드시 '조직명' 또는 '표시명' 열이 필요합니다.")
 
-    orgs = []
-    for _, row in df.iterrows():
-        org = str(row["조직명"]).strip()
-        if not org or org.lower() == "nan":
+    rows = []
+    for _, r in df.iterrows():
+        display = str(r[name_col]).strip()
+        if not display or display.lower() == "nan":
             continue
-        query = str(row["검색어"]).strip() if "검색어" in df.columns and str(row["검색어"]).strip() else org
-        item = {"org": org, "query": query}
-        if item not in orgs:
-            orgs.append(item)
-    return orgs
+
+        query = str(r.get("검색어", "")).strip() or display
+        kind = str(r.get("유형", "ORG")).strip().upper() or "ORG"
+
+        must_all = _split_list(r.get("MUST_ALL", ""))
+        must_any = _split_list(r.get("MUST_ANY", ""))
+        block    = _split_list(r.get("BLOCK", ""))
+
+        item = {
+            "display": display,
+            "query": query,
+            "kind": kind,
+            "must_all": must_all,
+            "must_any": must_any,
+            "block": block,
+            "query_tokens": _query_tokens_from(query),
+        }
+        rows.append(item)
+
+    # 중복 제거(표시명+쿼리 기준)
+    seen = set(); uniq = []
+    for it in rows:
+        key = (it["display"], it["query"])
+        if key not in seen:
+            uniq.append(it); seen.add(key)
+    return uniq
 
 # ---------- 네이버 뉴스 검색 ----------
 def search_naver(query, display=5):
@@ -134,7 +187,7 @@ def search_naver(query, display=5):
                 "summary": strip_html(it.get("description", "")),
             })
         return results
-    except:
+    except Exception:
         return []
 
 # ---------- NewsAPI ----------
@@ -173,7 +226,7 @@ def search_newsapi(query, window_from_utc, window_to_utc, language="ko"):
                 "summary": strip_html(a.get("description") or a.get("content") or ""),
             })
         return results
-    except:
+    except Exception:
         return []
 
 # ---------- 라벨 규칙 (폴백용) ----------
@@ -192,13 +245,13 @@ def rule_label(title, summary):
 def llm_enabled():
     return bool(os.environ.get("LLM_ENABLE", "").strip()) and bool(os.environ.get("OPENAI_API_KEY", "").strip()) and _HAS_OPENAI
 
-def llm_label(org, title, summary):
+def llm_label(display_name, title, summary):
     if not llm_enabled(): return None
     try:
         client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         prompt = f"""다음 기사가 조직에 미치는 영향을 분류하세요.
-조직: {org}
+조직: {display_name}
 제목: {title}
 요약: {summary}
 
@@ -216,19 +269,32 @@ def llm_label(org, title, summary):
         )
         out = (resp.choices[0].message.content or "").strip()
         return out if out in {"🔵","🟢","🟡","🔴"} else None
-    except:
+    except Exception:
         return None
 
-# ---------- 오탐 필터 ----------
-ALLOWED_BRAND_KWS = ["브라이언임팩트","사이드임팩트","brian impact","side impact"]
-BLOCK_COMMON = {"피아니스트","피플","시공간","끝까지간다"}
+# ---------- 행 규칙 기반 관련성 필터 ----------
+def _contains_all(text, toks):    return all(t in text for t in toks) if toks else True
+def _contains_any(text, toks):    return any(t in text for t in toks) if toks else True
+def _contains_none(text, toks):   return all(t not in text for t in toks) if toks else True
 
-def is_relevant(org, title, summary):
+def is_relevant_by_rule(row_cfg, title, summary):
+    """
+    row_cfg: fetch_org_list()가 반환한 한 행(dict)
+    1) query_tokens 중 하나는 반드시 포함 (이름/조직 자체 확인)
+    2) MUST_ALL 모두 포함
+    3) MUST_ANY 중 최소 1개 포함
+    4) BLOCK 단어가 포함되면 제외
+    """
     text = f"{title} {summary}".lower()
-    org_l = org.lower()
-    if org in BLOCK_COMMON:
-        return any(kw.lower() in text for kw in ALLOWED_BRAND_KWS)
-    return org_l in text
+    if row_cfg["query_tokens"] and not _contains_any(text, row_cfg["query_tokens"]):
+        return False
+    if not _contains_all(text, row_cfg["must_all"]):
+        return False
+    if not _contains_any(text, row_cfg["must_any"]):
+        return False
+    if not _contains_none(text, row_cfg["block"]):
+        return False
+    return True
 
 # ---------- Slack ----------
 def post_to_slack(lines):
@@ -244,7 +310,7 @@ def post_to_slack(lines):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    # ✅ 토/일이면 아무 것도 하지 않고 종료 (이중 안전장치)
+    # ✅ 토/일이면 스킵 (이중 안전장치)
     if now_kst().weekday() in (5, 6):  # 5=토, 6=일
         logging.info("Weekend (Sat/Sun) – skipping run.")
         return
@@ -254,28 +320,38 @@ def main():
 
     max_per_org = int(os.environ.get("MAX_RESULTS_PER_ORG", "1"))
 
-    org_rows = fetch_org_list()
-    logging.info("Loaded %d organizations.", len(org_rows))
+    rows = fetch_org_list()
+    logging.info("Loaded %d targets.", len(rows))
 
     all_lines = []
-    for idx, row in enumerate(org_rows, start=1):
-        org, query = row["org"], row["query"]
-        logging.info("(%d/%d) Searching: %s | %s", idx, len(org_rows), org, query)
+    for idx, row in enumerate(rows, start=1):
+        display = row["display"]
+        query   = row["query"]
+        logging.info("(%d/%d) Searching: %s | %s", idx, len(rows), display, query)
 
         naver_items = search_naver(query, display=max(10, max_per_org*4))
         time.sleep(0.25)
         newsapi_items = search_newsapi(query, window_from_utc, window_to_utc, language="ko")
+        logging.info("  raw: naver=%d, newsapi=%d", len(naver_items), len(newsapi_items))
 
         items = []
         for it in (naver_items + newsapi_items):
-            it["org"] = org
+            it["display"] = display
+            it["row_cfg"] = row
             items.append(it)
 
-        items = [it for it in items if is_relevant(it["org"], it["title"], it.get("summary",""))]
+        # 관련성 필터
+        before_rel = len(items)
+        items = [it for it in items if is_relevant_by_rule(it["row_cfg"], it["title"], it.get("summary",""))]
+        logging.info("  after relevance: %d -> %d", before_rel, len(items))
+
+        # 기간 필터
+        before_win = len(items)
         items = [it for it in items if it["published_at"] and window_from_utc <= it["published_at"] < window_to_utc]
+        logging.info("  after window: %d -> %d", before_win, len(items))
 
+        # 최신순 + 중복 제거
         items.sort(key=lambda x: x["published_at"], reverse=True)
-
         seen = set(); uniq = []
         for it in items:
             key = (norm_title(it["title"]), domain_from_url(it["url"]))
@@ -285,10 +361,11 @@ def main():
         take = uniq[:max_per_org]
 
         for art in take:
-            label = llm_label(art["org"], art["title"], art.get("summary","")) or rule_label(art["title"], art.get("summary",""))
+            label = llm_label(art["display"], art["title"], art.get("summary","")) or \
+                    rule_label(art["title"], art.get("summary",""))
             src = art["source"]
             when_str = to_kst_str(art["published_at"])
-            line = f"[{art['org']}] <{art['url']}|{art['title']}> ({src})({when_str}) [{label}]"
+            line = f"[{art['display']}] <{art['url']}|{art['title']}> ({src})({when_str}) [{label}]"
             all_lines.append(line)
 
     post_to_slack(all_lines)
