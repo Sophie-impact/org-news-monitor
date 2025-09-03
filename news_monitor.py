@@ -150,11 +150,13 @@ def fetch_org_list():
         rows.append(item)
 
     # 중복 제거(표시명+쿼리 기준)
-    seen = set(); uniq = []
-    for it in rows:
-        key = (it["display"], it["query"])
-        if key not in seen:
-            uniq.append(it); seen.add(key)
+    seen_titles = set()
+    uniq = []
+    for it in items:
+        title_key = norm_title(it["title"])
+        if title_key and it["url"] and title_key not in seen_titles:
+            uniq.append(it)
+            seen_titles.add(title_key)
     return uniq
 
 # ---------- 네이버 뉴스 검색 ----------
@@ -358,7 +360,7 @@ def main():
             if key not in seen and it["url"]:
                 uniq.append(it); seen.add(key)
 
-        take = uniq[:max_per_org]
+        take = uniq
 
         for art in take:
             label = llm_label(art["display"], art["title"], art.get("summary","")) or \
