@@ -84,7 +84,7 @@ def _split_list(val):
     return [x.strip().lower() for x in str(val).split(",") if x.strip()]
 
 def _query_tokens_from(q):
-    # "A" OR "B" → ["a","b"] 식으로 토큰화 (따옴표는 제거)
+    # "A" OR "B" → ["a","b"] 식으로 토큰화 (따옴표 제거)
     if not q:
         return []
     parts = re.split(r'\bOR\b', q, flags=re.IGNORECASE)
@@ -149,14 +149,14 @@ def fetch_org_list():
         }
         rows.append(item)
 
-    # 중복 제거(표시명+쿼리 기준)
-    seen_titles = set()
+    # 중복 제거(표시명+검색어 기준)
+    seen = set()
     uniq = []
-    for it in items:
-        title_key = norm_title(it["title"])
-        if title_key and it["url"] and title_key not in seen_titles:
+    for it in rows:
+        key = (it["display"], it["query"])
+        if key not in seen:
             uniq.append(it)
-            seen_titles.add(title_key)
+            seen.add(key)
     return uniq
 
 # ---------- 네이버 뉴스 검색 ----------
@@ -320,8 +320,6 @@ def main():
     window_from_utc, window_to_utc = compute_window_utc()
     logging.info("Window UTC: %s ~ %s", window_from_utc, window_to_utc)
 
-    max_per_org = int(os.environ.get("MAX_RESULTS_PER_ORG", "1"))
-
     rows = fetch_org_list()
     logging.info("Loaded %d targets.", len(rows))
 
@@ -331,7 +329,7 @@ def main():
         query   = row["query"]
         logging.info("(%d/%d) Searching: %s | %s", idx, len(rows), display, query)
 
-        naver_items = search_naver(query, display=max(10, max_per_org*4))
+        naver_items = search_naver(query, display=max(10, 20))
         time.sleep(0.25)
         newsapi_items = search_newsapi(query, window_from_utc, window_to_utc, language="ko")
         logging.info("  raw: naver=%d, newsapi=%d", len(naver_items), len(newsapi_items))
@@ -352,14 +350,17 @@ def main():
         items = [it for it in items if it["published_at"] and window_from_utc <= it["published_at"] < window_to_utc]
         logging.info("  after window: %d -> %d", before_win, len(items))
 
-        # 최신순 + 중복 제거
+        # 최신순 + 중복 제거(제목만 기준)
         items.sort(key=lambda x: x["published_at"], reverse=True)
-        seen = set(); uniq = []
+        seen_titles = set()
+        uniq = []
         for it in items:
-            key = (norm_title(it["title"]), domain_from_url(it["url"]))
-            if key not in seen and it["url"]:
-                uniq.append(it); seen.add(key)
+            title_key = norm_title(it["title"])
+            if title_key and it["url"] and title_key not in seen_titles:
+                uniq.append(it)
+                seen_titles.add(title_key)
 
+        # 제한 없이 전부 전송
         take = uniq
 
         for art in take:
