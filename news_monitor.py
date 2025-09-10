@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-News Monitor – LLM(본문 기반) 판별 통합 버전
+News Monitor – LLM(본문 기반) + 위험 힌트 강화 버전
 
 필요 env:
 - SHEET_CSV_URL
@@ -308,16 +308,29 @@ def rule_label(title: str, summary: str) -> str:
     return "🟢"
 
 
-# ---------- LLM 라벨러(본문 기반) ----------
+# ---------- 위험 힌트(키워드) ----------
+def _make_risk_hints(title: str, summary: str, content: str) -> str:
+    text = f"{title} {summary} {content}".lower()
+    neg_hits = [kw for kw in NEG_KW if kw.lower() in text]
+    watch_hits = [kw for kw in WATCH_KW if kw.lower() in text]
+    hints = []
+    if neg_hits:
+        hints.append(f"부정 키워드: {', '.join(neg_hits[:8])}")
+    if watch_hits:
+        hints.append(f"주의 키워드: {', '.join(watch_hits[:8])}")
+    return " / ".join(hints)
+
+
+# ---------- LLM 라벨러(본문 기반, 노랑 쪽 가중) ----------
 def llm_enabled() -> bool:
     flag = os.environ.get("LLM_ENABLE", "").strip().lower()
     enabled = flag in {"1","true","yes","on"}
     return enabled and bool(os.environ.get("OPENAI_API_KEY", "").strip()) and _HAS_OPENAI
 
-def llm_label(display_name: str, title: str, summary: str, content: str) -> str | None:
+def llm_label(display_name: str, title: str, summary: str, content: str, risk_hints: str = "") -> str | None:
     """
-    기사 '본문'까지 포함해서 라벨링. 결과는 {🔵,🟢,🟡,🔴} 중 하나만 반환.
-    실패/빈응답 시 None.
+    기사 본문까지 고려한 라벨링. 결과는 {🔵,🟢,🟡,🔴} 중 하나.
+    프롬프트를 강화해 '약한 부정/우려'는 🟡로 기울도록 설계.
     """
     if not llm_enabled():
         return None
@@ -331,6 +344,7 @@ def llm_label(display_name: str, title: str, summary: str, content: str) -> str 
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
         prompt = f"""당신은 언론/위기관리 분석가입니다. 아래 기사 내용이 '조직'에 미치는 영향을 평가하세요.
+모호하거나 정보가 불충분할 때는 '중립(🟢)'이 아니라 '팔로업 필요(🟡)'로 분류하세요.
 
 [조직]
 {display_name}
@@ -344,14 +358,21 @@ def llm_label(display_name: str, title: str, summary: str, content: str) -> str 
 [기사 본문(일부)]
 {body}
 
-라벨 규칙(중요):
-- 🔴 (부정/리스크): 비판적 보도, 논란/고발/수사/소송/제재 등 평판·법무·재정 리스크가 있거나, 명확한 부정적 영향이 예상되는 경우
-- 🟡 (팔로업 필요): 당장 부정은 아니지만 잠재적 이슈/논란 가능성·불확실성이 있어 추적 모니터링이 필요한 경우
-- 🟢 (중립): 정보성·사실 전달 위주로, 조직에 특별히 유리/불리하지 않은 경우
-- 🔵 (긍정): 수상·성과·투자·협력·호재 등 조직에 긍정적 영향을 주는 경우
+[신호 힌트(키워드 탐지 결과)]
+{risk_hints if risk_hints else "없음"}
+
+판단 규칙(중요, 우선순위 적용):
+1) 🔴 부정/리스크: 비판/논란/고발/수사/소송/제재/특검/리콜/결함/중대사고 등으로
+   조직의 평판·법무·재정 위험이 현실화되었거나 매우 높음.
+2) 🟡 팔로업 필요: 직접적 피해는 아니지만 부정적 뉘앙스·우려·논란 가능성·규제/조사 가능성 등
+   잠재 리스크가 존재하거나, 파장이 불확실하여 추적 모니터링이 필요한 경우.
+   (모호·정보부족·부정적 인상 → 🟡로 기울기)
+3) 🟢 중립: 긍/부정 효과가 뚜렷하지 않은 사실 전달/일반 보도.
+4) 🔵 긍정: 수상·성과·투자·협력·호재 등 조직에 명확히 유리.
 
 출력 형식: 라벨 기호 하나만 출력 (오직 🔴,🟡,🟢,🔵 중 하나)
 """
+
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -455,21 +476,22 @@ def main() -> None:
 
         # 제한 없이 전부 전송
         for art in uniq:
-            # 1) 본문 추출
+            # 1) 본문 추출 + 힌트 생성
             content = fetch_article_text(art["url"])
+            hints = _make_risk_hints(art["title"], art.get("summary",""), content)
 
             # 2) LLM 판별 (우선) – 실패 시 중립
             label = llm_label(
                 art["display"],
                 art["title"],
                 art.get("summary",""),
-                content
+                content,
+                risk_hints=hints
             ) or "🟢"
 
-            # 3) (선택) 규칙 보조 – 필요 시만 활성화
-            # rule = rule_label(art["title"], art.get("summary",""))
-            # if label == "🟢" and rule in {"🔴","🟡"}:
-            #     label = rule
+            # 3) (옵션) 보수적 승격: 중립인데 힌트가 있으면 🟡로 승격
+            if label == "🟢" and hints:
+                label = "🟡"
 
             src = art["source"]
             when_str = to_kst_str(art["published_at"])
