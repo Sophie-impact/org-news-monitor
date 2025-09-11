@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-News Monitor – LLM(본문 기반) + 위험 힌트 강화 버전
+News Monitor – LLM(본문 기반) + JSON 판단 + 보조 리스크 신호 버전
 
 필요 env:
 - SHEET_CSV_URL
-- NAVER_CLIENT_ID / NAVER_CLIENT_SECRET (네이버 뉴스)
-- NEWSAPI_KEY (NewsAPI)
-- SLACK_BOT_TOKEN / SLACK_CHANNEL (채널 ID 또는 #채널명)
-- OPENAI_API_KEY (LLM 사용 시)
-- LLM_ENABLE ("1" / "true" / "on" 등 truthy)
+- NAVER_CLIENT_ID / NAVER_CLIENT_SECRET
+- NEWSAPI_KEY
+- SLACK_BOT_TOKEN / SLACK_CHANNEL   # 채널 ID 또는 #채널명
+- OPENAI_API_KEY
+- LLM_ENABLE                        # "1"/"true"/"on" 등 truthy
 - LLM_MODEL (선택, 기본 gpt-4o-mini)
 """
 
@@ -20,6 +20,7 @@ import os
 import re
 import html
 import time
+import json
 import logging
 import requests
 import pandas as pd
@@ -41,7 +42,6 @@ except Exception:
     _HAS_OPENAI = False
 
 KST = ZoneInfo("Asia/Seoul")
-
 
 # ---------- 공통 유틸 ----------
 def now_kst() -> datetime:
@@ -84,11 +84,10 @@ def norm_title(t: str | None) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-
-# ---------- 조회 구간 계산 ----------
+# ---------- 조회 구간 ----------
 def compute_window_utc(now: datetime | None = None) -> tuple[datetime, datetime]:
     """
-    매일 09:00 KST 실행 기준 조회 구간:
+    매일 09:00 KST 실행 기준
     - 화~금: 전날 09:00 ~ 오늘 09:00
     - 월: 금요일 09:00 ~ 월요일 09:00
     """
@@ -99,7 +98,6 @@ def compute_window_utc(now: datetime | None = None) -> tuple[datetime, datetime]
     end_kst = anchor_kst
     return start_kst.astimezone(timezone.utc), end_kst.astimezone(timezone.utc)
 
-
 # ---------- 시트 파싱 유틸 ----------
 def _split_list(val) -> list[str]:
     if pd.isna(val) or str(val).strip() == "":
@@ -107,7 +105,7 @@ def _split_list(val) -> list[str]:
     return [x.strip().lower() for x in str(val).split(",") if x.strip()]
 
 def _query_tokens_from(q: str) -> list[str]:
-    # 'A' OR 'B' → ["a", "b"] (따옴표 제거)
+    # 'A' OR 'B' → ["a","b"] (따옴표 제거)
     if not q:
         return []
     parts = re.split(r'\bOR\b', q, flags=re.IGNORECASE)
@@ -118,14 +116,13 @@ def _query_tokens_from(q: str) -> list[str]:
             tokens.append(t)
     return tokens
 
-
 # ---------- 시트 읽기 ----------
 def fetch_org_list() -> list[dict]:
     """
-    반환: 리스트[{
+    반환: [{
       'display': 슬랙 표시명,
       'query': 검색어(없으면 display),
-      'kind': 'ORG' | 'PERSON',
+      'kind': 'ORG'|'PERSON',
       'must_all': [...], 'must_any': [...], 'block': [...],
       'query_tokens': [...]
     }, ...]
@@ -173,21 +170,17 @@ def fetch_org_list() -> list[dict]:
         rows.append(item)
 
     # 중복 제거(표시명+검색어 기준)
-    seen = set()
-    uniq = []
+    seen = set(); uniq = []
     for it in rows:
         key = (it["display"], it["query"])
         if key not in seen:
-            uniq.append(it)
-            seen.add(key)
+            uniq.append(it); seen.add(key)
     return uniq
-
 
 # ---------- 본문 추출 ----------
 def fetch_article_text(url: str, timeout: int = 20) -> str:
     """
-    주어진 URL의 본문 텍스트를 최대한 깔끔하게 추출.
-    trafilatura 우선, 실패 시 간단한 HTML->텍스트 폴백.
+    trafilatura 우선, 실패 시 requests + HTML 제거 폴백
     """
     if not url:
         return ""
@@ -206,7 +199,6 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
     except Exception:
         pass
 
-    # 폴백
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
@@ -214,8 +206,7 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
     except Exception:
         return ""
 
-
-# ---------- 네이버 뉴스 검색 ----------
+# ---------- 뉴스 검색 ----------
 def search_naver(query: str, display: int = 10) -> list[dict]:
     cid = os.environ.get("NAVER_CLIENT_ID", "")
     csec = os.environ.get("NAVER_CLIENT_SECRET", "")
@@ -248,8 +239,6 @@ def search_naver(query: str, display: int = 10) -> list[dict]:
     except Exception:
         return []
 
-
-# ---------- NewsAPI ----------
 def search_newsapi(query: str, window_from_utc: datetime, window_to_utc: datetime,
                    language: str = "ko") -> list[dict]:
     key = os.environ.get("NEWSAPI_KEY", "")
@@ -289,8 +278,7 @@ def search_newsapi(query: str, window_from_utc: datetime, window_to_utc: datetim
     except Exception:
         return []
 
-
-# ---------- 규칙 라벨(보조용, 선택) ----------
+# ---------- 규칙 라벨(폴백/참고) ----------
 NEG_KW = ["횡령","배임","사기","고발","기소","구속","수사","압수수색","소송","고소","분쟁","리콜","결함","징계","제재",
           "벌금","과징금","부실","파산","부도","중단","연기","오염","사망","부상","폭발","화재","추락","유출",
           "해킹","랜섬웨어","침해","악성코드","담합","독점","불매","논란","갑질","표절","혐의","불법","위법",
@@ -307,107 +295,98 @@ def rule_label(title: str, summary: str) -> str:
     if any(k.lower() in text for k in POS_KW): return "🔵"
     return "🟢"
 
+# ---------- 보조: 위험 신호(점수화) ----------
+STRONG_NEG = {"수사","고발","특검","기소","압수수색","제재","리콜","결함","사망","부상","폭발","화재","유출","랜섬웨어"}
 
-# ---------- 위험 힌트(키워드) ----------
-def _make_risk_hints(title: str, summary: str, content: str) -> str:
+def calc_risk_signals(title: str, summary: str, content: str):
     text = f"{title} {summary} {content}".lower()
-    neg_hits = [kw for kw in NEG_KW if kw.lower() in text]
+    neg_hits   = [kw for kw in NEG_KW   if kw.lower() in text]
     watch_hits = [kw for kw in WATCH_KW if kw.lower() in text]
+    pos_hits   = [kw for kw in POS_KW   if kw.lower() in text]
+    strong_neg = [kw for kw in STRONG_NEG if kw.lower() in text]
+
+    score = 2*len(neg_hits) + 1*len(watch_hits) - 1*len(pos_hits)  # 부정 2, 주의 1, 긍정 -1
     hints = []
-    if neg_hits:
-        hints.append(f"부정 키워드: {', '.join(neg_hits[:8])}")
-    if watch_hits:
-        hints.append(f"주의 키워드: {', '.join(watch_hits[:8])}")
-    return " / ".join(hints)
+    if neg_hits:   hints.append(f"부정:{', '.join(neg_hits[:8])}")
+    if watch_hits: hints.append(f"주의:{', '.join(watch_hits[:8])}")
+    if pos_hits:   hints.append(f"긍정:{', '.join(pos_hits[:8])}")
+    return {"score": score, "strong_neg": strong_neg, "hints_text": " / ".join(hints) if hints else ""}
 
+# ---------- LLM 라벨러(JSON) ----------
+IMPACT_MAP = {"positive":"🔵","neutral":"🟢","monitor":"🟡","negative":"🔴"}
 
-# ---------- LLM 라벨러(본문 기반, 노랑 쪽 가중) ----------
+def _safe_load_json(s: str):
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
 def llm_enabled() -> bool:
     flag = os.environ.get("LLM_ENABLE", "").strip().lower()
     enabled = flag in {"1","true","yes","on"}
     return enabled and bool(os.environ.get("OPENAI_API_KEY", "").strip()) and _HAS_OPENAI
 
-def llm_label(display_name: str, title: str, summary: str, content: str, risk_hints: str = "") -> str | None:
+def llm_label(display_name: str, title: str, summary: str, content: str, hints_text: str = ""):
     """
-    기사 본문까지 고려한 라벨링. 결과는 {🔵,🟢,🟡,🔴} 중 하나.
-    프롬프트를 강화해 '약한 부정/우려'는 🟡로 기울도록 설계.
+    JSON으로 {impact, confidence, evidence[]} 반환 → {label, confidence, raw} or None
     """
     if not llm_enabled():
         return None
 
     body = (content or "").strip()
-    if len(body) > 3500:  # 비용/속도 최적화
+    if len(body) > 3500:
         body = body[:3500]
 
     try:
         client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
-        prompt = f"""당신은 언론/위기관리 분석가입니다. 아래 기사 내용이 '조직'에 미치는 영향을 평가하세요.
-모호하거나 정보가 불충분할 때는 '중립(🟢)'이 아니라 '팔로업 필요(🟡)'로 분류하세요.
+        prompt = f"""역할: 당신은 위기관리 분석가입니다. 다음 기사가 '조직'에 주는 '영향'만 평가하세요.
+- 긍정/중립/모니터링 필요/부정 네 가지 중 하나로 결정합니다.
+- 조직 관점의 '실질적 영향'에 집중합니다(산업 일반 논평은 가중치 낮음).
+- 불확실하거나 양가적이면 '모니터링 필요'를 권장합니다.
+
+JSON으로만 출력:
+{{
+  "impact": "positive|neutral|monitor|negative",
+  "confidence": 0.0-1.0,
+  "evidence": ["짧은 근거 1-2개"]
+}}
 
 [조직]
 {display_name}
 
-[기사 제목]
+[제목]
 {title}
 
-[요약/리드]
+[요약]
 {summary}
 
-[기사 본문(일부)]
+[본문(일부)]
 {body}
 
-[신호 힌트(키워드 탐지 결과)]
-{risk_hints if risk_hints else "없음"}
-
-판단 규칙(중요, 우선순위 적용):
-1) 🔴 부정/리스크: 비판/논란/고발/수사/소송/제재/특검/리콜/결함/중대사고 등으로
-   조직의 평판·법무·재정 위험이 현실화되었거나 매우 높음.
-2) 🟡 팔로업 필요: 직접적 피해는 아니지만 부정적 뉘앙스·우려·논란 가능성·규제/조사 가능성 등
-   잠재 리스크가 존재하거나, 파장이 불확실하여 추적 모니터링이 필요한 경우.
-   (모호·정보부족·부정적 인상 → 🟡로 기울기)
-3) 🟢 중립: 긍/부정 효과가 뚜렷하지 않은 사실 전달/일반 보도.
-4) 🔵 긍정: 수상·성과·투자·협력·호재 등 조직에 명확히 유리.
-
-출력 형식: 라벨 기호 하나만 출력 (오직 🔴,🟡,🟢,🔵 중 하나)
+[키워드 힌트]
+{hints_text or "없음"}
 """
-
         resp = client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role":"user","content":prompt}],
             temperature=0,
-            max_tokens=4,
+            max_tokens=220,
         )
-        out = (resp.choices[0].message.content or "").strip()
-        return out if out in {"🔵","🟢","🟡","🔴"} else None
+        raw = (resp.choices[0].message.content or "").strip()
+        data = _safe_load_json(raw)
+        if not data:
+            return None
+
+        impact = str(data.get("impact","")).lower()
+        conf = float(data.get("confidence", 0.5))
+        label = IMPACT_MAP.get(impact)
+        if not label:
+            return None
+        return {"label": label, "confidence": conf, "raw": data}
     except Exception:
         return None
-
-
-# ---------- 행 규칙 기반 관련성 필터 ----------
-def _contains_all(text: str, toks: list[str]) -> bool:  return all(t in text for t in toks) if toks else True
-def _contains_any(text: str, toks: list[str]) -> bool:  return any(t in text for t in toks) if toks else True
-def _contains_none(text: str, toks: list[str]) -> bool: return all(t not in text for t in toks) if toks else True
-
-def is_relevant_by_rule(row_cfg: dict, title: str, summary: str) -> bool:
-    """
-    1) query_tokens 중 하나는 반드시 포함
-    2) MUST_ALL 모두 포함
-    3) MUST_ANY 중 최소 1개 포함
-    4) BLOCK 단어가 포함되면 제외
-    """
-    text = f"{title} {summary}".lower()
-    if row_cfg["query_tokens"] and not _contains_any(text, row_cfg["query_tokens"]):
-        return False
-    if not _contains_all(text, row_cfg["must_all"]):
-        return False
-    if not _contains_any(text, row_cfg["must_any"]):
-        return False
-    if not _contains_none(text, row_cfg["block"]):
-        return False
-    return True
-
 
 # ---------- Slack ----------
 def post_to_slack(lines: list[str]) -> None:
@@ -419,12 +398,11 @@ def post_to_slack(lines: list[str]) -> None:
     text = "\n".join(lines) if lines else "오늘은 신규로 감지된 기사가 없습니다."
     client.chat_postMessage(channel=channel, text=text)
 
-
 # ---------- main ----------
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    # ✅ 토/일이면 스킵
+    # 주말 스킵
     if now_kst().weekday() in (5, 6):  # 5=토, 6=일
         logging.info("Weekend (Sat/Sun) – skipping run.")
         return
@@ -441,13 +419,11 @@ def main() -> None:
         query   = row["query"]
         logging.info("(%d/%d) Searching: %s | %s", idx, len(rows), display, query)
 
-        # 검색
         naver_items = search_naver(query, display=max(10, 20))
         time.sleep(0.25)
         newsapi_items = search_newsapi(query, window_from_utc, window_to_utc, language="ko")
         logging.info("  raw: naver=%d, newsapi=%d", len(naver_items), len(newsapi_items))
 
-        # 합치기
         items: list[dict] = []
         for it in (naver_items + newsapi_items):
             it["display"] = display
@@ -464,33 +440,37 @@ def main() -> None:
         items = [it for it in items if it["published_at"] and window_from_utc <= it["published_at"] < window_to_utc]
         logging.info("  after window: %d -> %d", before_win, len(items))
 
-        # 최신순 + 중복 제거(제목만 기준)
+        # 최신순 + 제목 기준 디듑
         items.sort(key=lambda x: x["published_at"], reverse=True)
-        seen_titles = set()
-        uniq = []
+        seen_titles = set(); uniq = []
         for it in items:
             title_key = norm_title(it["title"])
             if title_key and it["url"] and title_key not in seen_titles:
-                uniq.append(it)
-                seen_titles.add(title_key)
+                uniq.append(it); seen_titles.add(title_key)
 
-        # 제한 없이 전부 전송
+        # 제한 없이 전부 처리
         for art in uniq:
-            # 1) 본문 추출 + 힌트 생성
             content = fetch_article_text(art["url"])
-            hints = _make_risk_hints(art["title"], art.get("summary",""), content)
+            signals = calc_risk_signals(art["title"], art.get("summary",""), content)
 
-            # 2) LLM 판별 (우선) – 실패 시 중립
-            label = llm_label(
-                art["display"],
-                art["title"],
-                art.get("summary",""),
-                content,
-                risk_hints=hints
-            ) or "🟢"
+            # LLM 우선
+            llm_out = llm_label(
+                art["display"], art["title"], art.get("summary",""),
+                content, hints_text=signals["hints_text"]
+            )
+            if llm_out:
+                label = llm_out["label"]
+                conf  = llm_out["confidence"]
+            else:
+                label = rule_label(art["title"], art.get("summary",""))
+                conf  = 0.5
 
-            # 3) (옵션) 보수적 승격: 중립인데 힌트가 있으면 🟡로 승격
-            if label == "🟢" and hints:
+            # 강한 부정 신호는 보수적 오버라이드(단, LLM이 명확한 🔵인 경우는 존중)
+            if signals["strong_neg"] and label in {"🟢","🟡"}:
+                label = "🔴"
+
+            # 리스크 점수 기반 보정: LLM이 🔵/🟢이고 확신 낮고(score 높음) → 🟡
+            if label in {"🔵","🟢"} and conf < 0.7 and signals["score"] >= 3:
                 label = "🟡"
 
             src = art["source"]
@@ -500,7 +480,6 @@ def main() -> None:
 
     post_to_slack(all_lines)
     logging.info("Posted %d lines to Slack.", len(all_lines))
-
 
 if __name__ == "__main__":
     main()
