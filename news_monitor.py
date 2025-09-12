@@ -5,8 +5,8 @@
 News Monitor – 본문 추출 + LLM(JSON) 판단 + 규칙/키워드 보조 + 주말 스킵
 - 시트 규칙(MUST_ALL/MUST_ANY/BLOCK/검색어)로 1차 필터
 - trafilatura로 본문 추출 후 LLM이 조직 관점 영향(긍정/중립/모니터/부정)을 JSON으로 판정
-- 강부정 키워드/리스크 점수로 보수적 보정 (과한 노란색 방지 로직 포함)
-- 동일 제목(정규화) 중복 제거
+- 강부정 키워드/리스크 점수로 보수적 보정 (과한 노란색 방지 포함)
+- 동일 제목(정규화) 중복 제거(도메인 상관없이 같은 제목은 1개만)
 """
 
 from __future__ import annotations
@@ -25,13 +25,13 @@ from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError  # noqa: F401 (예비)
+from slack_sdk.errors import SlackApiError
 import tldextract
 import trafilatura
 
-# --- LLM (OpenAI) ---
+# --- LLM (OpenAI; optional) ---
 try:
-    import openai  # pip install openai>=1.40.0
+    import openai  # openai>=1.40.0
     _HAS_OPENAI = True
 except Exception:
     _HAS_OPENAI = False
@@ -152,14 +152,9 @@ def fetch_org_list() -> list[dict]:
         if not display or display.lower() == "nan":
             continue
 
-        # 검색어 NaN/공백/문자열 'nan' 모두 방지
-        raw_q = r.get("검색어", "")
-        if pd.isna(raw_q) or str(raw_q).strip() == "" or str(raw_q).strip().lower() == "nan":
-            query = display
-        else:
-            query = str(raw_q).strip()
-
+        query = str(r.get("검색어", "")).strip() or display
         kind = str(r.get("유형", "ORG")).strip().upper() or "ORG"
+
         must_all = _split_list(r.get("MUST_ALL", ""))
         must_any = _split_list(r.get("MUST_ANY", ""))
         block    = _split_list(r.get("BLOCK", ""))
@@ -192,7 +187,6 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
     """
     if not url:
         return ""
-    # 1) trafilatura
     try:
         downloaded = trafilatura.fetch_url(url, no_ssl=True, timeout=timeout)
         if downloaded:
@@ -204,12 +198,10 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
                 favor_recall=True,
                 deduplicate=True,
             ) or ""
-            if text:
-                return text.strip()
+            return text.strip()
     except Exception:
         pass
 
-    # 2) requests + strip
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
@@ -311,7 +303,7 @@ def rule_label(title: str, summary: str) -> str:
     return "🟢"
 
 # =========================
-# 행 규칙 기반 관련성 필터
+# (필수) 행 규칙 기반 관련성 필터  ← 누락되면 NameError 발생
 # =========================
 def _contains_all(text: str, toks: list[str]) -> bool:
     return all(t in text for t in toks) if toks else True
@@ -331,8 +323,10 @@ def is_relevant_by_rule(row_cfg: dict, title: str, summary: str) -> bool:
     """
     text = f"{title} {summary}".lower()
 
-    if row_cfg.get("query_tokens") and not _contains_any(text, row_cfg["query_tokens"]):
+    tokens = row_cfg.get("query_tokens") or []
+    if tokens and not _contains_any(text, tokens):
         return False
+
     if not _contains_all(text, row_cfg.get("must_all", [])):
         return False
 
@@ -342,6 +336,7 @@ def is_relevant_by_rule(row_cfg: dict, title: str, summary: str) -> bool:
 
     if not _contains_none(text, row_cfg.get("block", [])):
         return False
+
     return True
 
 # =========================
@@ -446,7 +441,7 @@ JSON으로만 출력:
 # =========================
 def post_to_slack(lines: list[str]) -> None:
     token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
-    channel = os.environ.get("SLACK_CHANNEL", "").strip()
+    channel = os.environ.get("SLACK_CHANNEL", "").strip()  # 채널 ID(추천) 또는 #채널명
     if not token or not channel:
         raise RuntimeError("SLACK_BOT_TOKEN or SLACK_CHANNEL missing.")
     client = WebClient(token=token)
@@ -459,7 +454,7 @@ def post_to_slack(lines: list[str]) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    # 주말 스킵
+    # 주말 스킵 (GitHub Actions가 주말에도 도는 경우 안전장치)
     if now_kst().weekday() in (5, 6):  # 5=토, 6=일
         logging.info("Weekend (Sat/Sun) – skipping run.")
         return
@@ -522,11 +517,9 @@ def main() -> None:
                 label = rule_label(art["title"], art.get("summary",""))
                 conf  = 0.5
 
-            # 강한 부정 신호 있으면 보수적 오버라이드(🔴)
+            # 보수적 보정
             if signals["strong_neg"] and label in {"🟢","🟡"}:
                 label = "🔴"
-
-            # 리스크 점수 기반 보정: LLM이 🔵/🟢이고 확신 낮고(score 높음) → 🟡
             if label in {"🔵","🟢"} and conf < 0.7 and signals["score"] >= 3:
                 label = "🟡"
 
