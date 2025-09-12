@@ -5,33 +5,25 @@
 News Monitor – 본문 추출 + LLM(JSON) 판단 + 규칙/키워드 보조 + 주말 스킵
 - 시트 규칙(MUST_ALL/MUST_ANY/BLOCK/검색어)로 1차 필터
 - trafilatura로 본문 추출 후 LLM이 조직 관점 영향(긍정/중립/모니터/부정)을 JSON으로 판정
-- 강부정 키워드/리스크 점수로 보수적 보정 (과한 노란색 방지 포함)
-- 동일 제목(정규화) 중복 제거(도메인 상관없이 같은 제목은 1개만)
+- 강부정 키워드/리스크 점수로 보수적 보정 (과한 노란색 방지)
+- 동일 제목(정규화) 중복 제거
 """
 
 from __future__ import annotations
 
-import os
-import re
-import html
-import time
-import json
-import logging
-import requests
-import pandas as pd
+import os, re, html, time, json, logging, requests, pandas as pd
 from io import StringIO
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
-import tldextract
-import trafilatura
+from slack_sdk.errors import SlackApiError  # noqa: F401
+import tldextract, trafilatura
 
-# --- LLM (OpenAI; optional) ---
+# --- LLM (OpenAI) ---
 try:
-    import openai  # openai>=1.40.0
+    import openai  # pip install openai>=1.40.0
     _HAS_OPENAI = True
 except Exception:
     _HAS_OPENAI = False
@@ -286,14 +278,21 @@ def search_newsapi(query: str, window_from_utc: datetime, window_to_utc: datetim
 # =========================
 # 규칙 라벨(폴백/참고)
 # =========================
-NEG_KW = ["횡령","배임","사기","고발","기소","구속","수사","압수수색","소송","고소","분쟁","리콜","결함","징계","제재",
-          "벌금","과징금","부실","파산","부도","중단","연기","오염","사망","부상","폭발","화재","추락","유출",
-          "해킹","랜섬웨어","침해","악성코드","담합","독점","불매","논란","갑질","표절","혐의","불법","위법",
-          "취소","철회","부정","적자","감소","급락","하락","경고","경보","리스크","소환","징역"]
+NEG_KW = [
+    "횡령","배임","사기","고발","기소","구속","수사","압수수색","소송","고소","분쟁",
+    "리콜","결함","징계","제재","벌금","과징금","부실","파산","부도","중단","연기","오염",
+    "사망","부상","폭발","화재","추락","유출","해킹","랜섬웨어","침해","악성코드",
+    "담합","독점","불매","논란","갑질","표절","혐의","불법","위법","취소","철회","부정",
+    "적자","감소","급락","하락","경고","경보","리스크","소환","징역","특검","부담"
+]
 WATCH_KW = ["의혹","점검","조사","심사","검토","논의","잠정","연구결과","유예","우려","관심","주시","잠정치","공정위","국감",
             "지적","요구","연장","변동성","불확실성"]
-POS_KW = ["투자유치","시리즈","라운드","유치","수상","선정","혁신","신기록","최대","상승","증가","호조","호재","확대",
-          "진출","오픈","출시","공개","협력","파트너십","MOU","계약","수주","달성","성과","흑자","흑자전환","개최"]
+POS_KW = [
+    "투자유치","시리즈","라운드","유치","수상","선정","혁신","신기록","최대","상승","증가","호조","호재","확대",
+    "진출","오픈","출시","공개","협력","파트너십","mou","계약","수주","달성","성과","흑자","흑자전환","개최",
+    # 긍정 보강
+    "후원","지원","기부","기증","기탁","전달","수여","시상","표창","장학금","증정","수혜","인증","승인","채택","공모 선정"
+]
 
 def rule_label(title: str, summary: str) -> str:
     text = f"{title} {summary}".lower()
@@ -303,7 +302,7 @@ def rule_label(title: str, summary: str) -> str:
     return "🟢"
 
 # =========================
-# (필수) 행 규칙 기반 관련성 필터  ← 누락되면 NameError 발생
+# 행 규칙 기반 관련성 필터
 # =========================
 def _contains_all(text: str, toks: list[str]) -> bool:
     return all(t in text for t in toks) if toks else True
@@ -323,20 +322,15 @@ def is_relevant_by_rule(row_cfg: dict, title: str, summary: str) -> bool:
     """
     text = f"{title} {summary}".lower()
 
-    tokens = row_cfg.get("query_tokens") or []
-    if tokens and not _contains_any(text, tokens):
+    if row_cfg.get("query_tokens") and not _contains_any(text, row_cfg["query_tokens"]):
         return False
-
     if not _contains_all(text, row_cfg.get("must_all", [])):
         return False
-
     must_any = row_cfg.get("must_any", [])
     if must_any and not _contains_any(text, must_any):
         return False
-
     if not _contains_none(text, row_cfg.get("block", [])):
         return False
-
     return True
 
 # =========================
@@ -390,9 +384,11 @@ def llm_label(display_name: str, title: str, summary: str, content: str, hints_t
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
         prompt = f"""역할: 당신은 위기관리 분석가입니다. 다음 기사가 '조직'에 주는 '영향'만 평가하세요.
-- 긍정/중립/모니터링 필요/부정 네 가지 중 하나로 결정합니다.
-- 조직 관점의 '실질적 영향'에 집중합니다(산업 일반 논평은 가중치 낮음).
-- 불확실하거나 양가적이면 '모니터링 필요'를 권장합니다.
+- 네 가지 중 하나로 결정합니다: positive(긍정), neutral(중립), monitor(모니터링 필요), negative(부정).
+- **긍정 신호 가이드**: "수상, 선정, 후원, 지원, 기부, 투자유치, 파트너십, MOU, 협력, 계약, 수주, 인증/승인" 등은 기본적으로 긍정적 영향으로 간주합니다.
+- 기사에 '논란/비판/조사/위법/리스크' 맥락이 명시되어 있지 않으면 긍정/중립으로 분류하세요.
+- 산업 일반 논평은 가중치를 낮게, 조직 직접 영향은 가중치를 높게 반영합니다.
+- 판단이 애매하면 monitor를 사용할 수 있으나, 위의 긍정 신호가 뚜렷하면 positive/neutral을 우선합니다.
 
 JSON으로만 출력:
 {{
@@ -441,7 +437,7 @@ JSON으로만 출력:
 # =========================
 def post_to_slack(lines: list[str]) -> None:
     token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
-    channel = os.environ.get("SLACK_CHANNEL", "").strip()  # 채널 ID(추천) 또는 #채널명
+    channel = os.environ.get("SLACK_CHANNEL", "").strip()
     if not token or not channel:
         raise RuntimeError("SLACK_BOT_TOKEN or SLACK_CHANNEL missing.")
     client = WebClient(token=token)
@@ -454,7 +450,7 @@ def post_to_slack(lines: list[str]) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    # 주말 스킵 (GitHub Actions가 주말에도 도는 경우 안전장치)
+    # 주말 스킵
     if now_kst().weekday() in (5, 6):  # 5=토, 6=일
         logging.info("Weekend (Sat/Sun) – skipping run.")
         return
@@ -517,10 +513,12 @@ def main() -> None:
                 label = rule_label(art["title"], art.get("summary",""))
                 conf  = 0.5
 
-            # 보수적 보정
+            # 강한 부정 신호 있으면 보수적 오버라이드(🔴)
             if signals["strong_neg"] and label in {"🟢","🟡"}:
                 label = "🔴"
-            if label in {"🔵","🟢"} and conf < 0.7 and signals["score"] >= 3:
+
+            # 리스크 점수 기반 보정(완화): LLM이 🔵/🟢이고 확신 낮고(score 높음) → 🟡
+            if label in {"🔵","🟢"} and conf < 0.7 and signals["score"] >= 5:
                 label = "🟡"
 
             src = art["source"]
