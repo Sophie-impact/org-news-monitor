@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
+from slack_sdk.errors import SlackApiError  # noqa: F401 (예비)
 import tldextract
 import trafilatura
 
@@ -152,9 +152,14 @@ def fetch_org_list() -> list[dict]:
         if not display or display.lower() == "nan":
             continue
 
-        query = str(r.get("검색어", "")).strip() or display
-        kind = str(r.get("유형", "ORG")).strip().upper() or "ORG"
+        # 검색어 NaN/공백/문자열 'nan' 모두 방지
+        raw_q = r.get("검색어", "")
+        if pd.isna(raw_q) or str(raw_q).strip() == "" or str(raw_q).strip().lower() == "nan":
+            query = display
+        else:
+            query = str(raw_q).strip()
 
+        kind = str(r.get("유형", "ORG")).strip().upper() or "ORG"
         must_all = _split_list(r.get("MUST_ALL", ""))
         must_any = _split_list(r.get("MUST_ANY", ""))
         block    = _split_list(r.get("BLOCK", ""))
@@ -187,6 +192,7 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
     """
     if not url:
         return ""
+    # 1) trafilatura
     try:
         downloaded = trafilatura.fetch_url(url, no_ssl=True, timeout=timeout)
         if downloaded:
@@ -198,10 +204,12 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
                 favor_recall=True,
                 deduplicate=True,
             ) or ""
-            return text.strip()
+            if text:
+                return text.strip()
     except Exception:
         pass
 
+    # 2) requests + strip
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
@@ -212,7 +220,7 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
 # =========================
 # 뉴스 검색기
 # =========================
-def search_naver(query: str, display: int = 10) -> list[dict]:
+def search_naver(query: str, display: int = 20) -> list[dict]:
     cid = os.environ.get("NAVER_CLIENT_ID", "")
     csec = os.environ.get("NAVER_CLIENT_SECRET", "")
     if not cid or not csec:
@@ -303,7 +311,7 @@ def rule_label(title: str, summary: str) -> str:
     return "🟢"
 
 # =========================
-# (추가) 행 규칙 기반 관련성 필터  ✅ (누락됐던 부분)
+# 행 규칙 기반 관련성 필터
 # =========================
 def _contains_all(text: str, toks: list[str]) -> bool:
     return all(t in text for t in toks) if toks else True
@@ -327,9 +335,11 @@ def is_relevant_by_rule(row_cfg: dict, title: str, summary: str) -> bool:
         return False
     if not _contains_all(text, row_cfg.get("must_all", [])):
         return False
+
     must_any = row_cfg.get("must_any", [])
     if must_any and not _contains_any(text, must_any):
         return False
+
     if not _contains_none(text, row_cfg.get("block", [])):
         return False
     return True
