@@ -2,44 +2,29 @@
 # -*- coding: utf-8 -*-
 
 """
-News Monitor – Gemini+Claude 통합 개선 버전
-- 컨텍스트 기반 키워드 분석 (직접부정/상황부정/모니터링/긍정)
-- LLM 프롬프트 강화 (primary_reason, org_relevance, confidence)
-- 다층 검증: 규칙 → LLM(신뢰도) → 보수적 검증 → 과도한 🔴 완화
-- 주말 스킵, 조회구간(월=3일, 그외=1일), 본문 추출(trafilatura)
-- 제목 기준 dedup, 캐싱(제목+본문 해시)로 재분석 방지
-- Slack 전송 시 신뢰도 표시(!/?), 주요 근거 요약
+News Monitor – 컨텍스트+LLM 통합 라벨링 (예외 조직별 중복제거 정책 포함)
+- 시트 규칙(MUST_ALL/MUST_ANY/BLOCK/검색어) 1차 필터
+- 본문 추출(trafilatura) → 컨텍스트 기반 신호 분석 → 개선된 LLM(JSON) 판단
+- 다층 통합: 규칙/신호/LLM 결과를 일관성 있게 결합
+- 캐시로 동일 기사 재분석 방지, 상세 로깅/통계
+- 주말 자동 스킵
+- [중복정책] 카카오/브라이언임팩트/김범수는 중복 제거 없이 모두 노출, 그 외 조직은 같은 제목(정규화) 1개만 노출
 """
 
 from __future__ import annotations
 
-import os
-import re
-import html
-import time
-import json
-import logging
-import hashlib
-import requests
-import pandas as pd
+import os, re, html, time, json, logging, requests, pandas as pd, hashlib
 from io import StringIO
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
-from collections import defaultdict
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError  # noqa: F401
-import tldextract
+import tldextract, trafilatura
+from collections import defaultdict
 
-# 본문 추출 (옵션)
-try:
-    import trafilatura
-    _HAS_TRAFILATURA = True
-except Exception:
-    _HAS_TRAFILATURA = False
-
-# OpenAI LLM (옵션)
+# --- LLM (OpenAI) ---
 try:
     import openai  # pip install openai>=1.40.0
     _HAS_OPENAI = True
@@ -48,11 +33,16 @@ except Exception:
 
 KST = ZoneInfo("Asia/Seoul")
 
-# =========================================================
-# 컨텍스트 기반 키워드
-# =========================================================
+# ============================================================
+# 예외 조직 (제목 중복 제거를 적용하지 않음)
+# ============================================================
+DEDUP_EXEMPT_ORGS = {"카카오", "브라이언임팩트", "김범수"}
+
+# ============================================================
+# 컨텍스트 키워드 세트
+# ============================================================
 DIRECT_NEGATIVE = {
-    "법적": ["횡령", "배임", "사기", "고발", "기소", "구속", "수사", "압수수색", "징역", "실형", "특검"],
+    "법적": ["횡령", "배임", "사기", "고발", "기소", "구속", "수사", "압수수색", "특검", "징역", "실형"],
     "사업": ["리콜", "결함", "파산", "부도", "영업정지", "사업중단", "퇴출"],
     "안전": ["사망", "부상", "폭발", "화재", "추락", "유출", "해킹", "랜섬웨어", "개인정보유출"],
 }
@@ -67,15 +57,15 @@ MONITORING_KEYWORDS = {
     "주의": ["우려", "경고", "리스크", "변동성", "관심", "주시"],
 }
 POSITIVE_KEYWORDS = {
-    "성과": ["수상", "선정", "혁신", "신기록", "달성", "성과", "흑자전환", "최대"],
-    "성장": ["투자유치", "상승", "증가", "호조", "확대", "진출", "성장"],
+    "성과": ["수상", "선정", "혁신", "신기록", "최대", "달성", "성과", "흑자전환"],
+    "성장": ["투자유치", "시리즈", "상승", "증가", "호조", "확대", "진출", "성장"],
     "협력": ["협력", "파트너십", "mou", "계약", "수주", "제휴", "연합"],
     "사회공헌": ["후원", "지원", "기부", "기증", "기탁", "장학금", "봉사"],
 }
 
-# =========================================================
+# ============================================================
 # 유틸
-# =========================================================
+# ============================================================
 def now_kst() -> datetime:
     return datetime.now(tz=KST)
 
@@ -91,7 +81,7 @@ def parse_datetime(dt_str: str | None) -> datetime | None:
         return None
 
 def to_kst_str(dt: datetime | None) -> str:
-    if not dt:
+    if dt is None:
         return ""
     return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M")
 
@@ -119,25 +109,20 @@ def norm_title(t: str | None) -> str:
 def content_hash(title: str, content: str) -> str:
     return hashlib.md5(f"{title}:{content[:1000]}".encode()).hexdigest()
 
-# =========================================================
-# 조회 구간 (09:00 KST 기준)
-# =========================================================
+# ============================================================
+# 조회 구간 (09:00 KST 실행 기준)
+# ============================================================
 def compute_window_utc(now: datetime | None = None) -> tuple[datetime, datetime]:
-    """
-    실행 시간 09:00 KST 기준
-    - 화~금: 전날 09:00 ~ 오늘 09:00
-    - 월: 금 09:00 ~ 월 09:00
-    """
-    now = now or now_kst()
+    now = now or datetime.now(tz=KST)
     anchor_kst = now.astimezone(KST).replace(hour=9, minute=0, second=0, microsecond=0)
-    days = 3 if anchor_kst.weekday() == 0 else 1
+    days = 3 if anchor_kst.weekday() == 0 else 1  # 월요일이면 3일 커버
     start_kst = anchor_kst - timedelta(days=days)
     end_kst = anchor_kst
     return start_kst.astimezone(timezone.utc), end_kst.astimezone(timezone.utc)
 
-# =========================================================
-# 시트 로딩 / 관련성 필터
-# =========================================================
+# ============================================================
+# 시트 로더
+# ============================================================
 def _split_list(val) -> list[str]:
     if pd.isna(val) or str(val).strip() == "":
         return []
@@ -146,7 +131,7 @@ def _split_list(val) -> list[str]:
 def _query_tokens_from(q: str) -> list[str]:
     if not q:
         return []
-    parts = re.split(r"\bOR\b", q, flags=re.IGNORECASE)
+    parts = re.split(r'\bOR\b', q, flags=re.IGNORECASE)
     tokens = []
     for p in parts:
         t = p.strip().strip('"').strip("'").lower()
@@ -155,11 +140,6 @@ def _query_tokens_from(q: str) -> list[str]:
     return tokens
 
 def fetch_org_list() -> list[dict]:
-    """
-    CSV 헤더(예):
-    - 조직명(또는 표시명), 검색어(옵션), 유형(ORG|PERSON 옵션),
-      MUST_ALL, MUST_ANY, BLOCK (쉼표구분, 옵션)
-    """
     sheet_url = os.environ.get("SHEET_CSV_URL", "").strip()
     if not sheet_url:
         raise RuntimeError("SHEET_CSV_URL env var is not set.")
@@ -170,9 +150,9 @@ def fetch_org_list() -> list[dict]:
     df = pd.read_csv(StringIO(csv_text))
 
     name_col = None
-    for c in ["조직명", "표시명"]:
-        if c in df.columns:
-            name_col = c
+    for candidate in ["조직명", "표시명"]:
+        if candidate in df.columns:
+            name_col = candidate
             break
     if not name_col:
         raise RuntimeError("CSV에는 반드시 '조직명' 또는 '표시명' 열이 필요합니다.")
@@ -182,8 +162,10 @@ def fetch_org_list() -> list[dict]:
         display = str(r[name_col]).strip()
         if not display or display.lower() == "nan":
             continue
+
         query = str(r.get("검색어", "")).strip() or display
         kind = str(r.get("유형", "ORG")).strip().upper() or "ORG"
+
         must_all = _split_list(r.get("MUST_ALL", ""))
         must_any = _split_list(r.get("MUST_ANY", ""))
         block    = _split_list(r.get("BLOCK", ""))
@@ -198,7 +180,6 @@ def fetch_org_list() -> list[dict]:
             "query_tokens": _query_tokens_from(query),
         })
 
-    # 표시명+검색어 기준 중복 제거
     seen = set(); uniq = []
     for it in rows:
         key = (it["display"], it["query"])
@@ -206,58 +187,27 @@ def fetch_org_list() -> list[dict]:
             uniq.append(it); seen.add(key)
     return uniq
 
-def _contains_all(text: str, toks: list[str]) -> bool:
-    return all(t in text for t in toks) if toks else True
-
-def _contains_any(text: str, toks: list[str]) -> bool:
-    return any(t in text for t in toks) if toks else True
-
-def _contains_none(text: str, toks: list[str]) -> bool:
-    return all(t not in text for t in toks) if toks else True
-
-def is_relevant_by_rule(row_cfg: dict, title: str, summary: str) -> bool:
-    """
-    1) query_tokens 중 하나라도 포함(있을 때)
-    2) MUST_ALL 모두 포함
-    3) MUST_ANY 중 최소 1개 포함(있을 때)
-    4) BLOCK 포함 시 제외
-    """
-    text = f"{title} {summary}".lower()
-    if row_cfg.get("query_tokens") and not _contains_any(text, row_cfg["query_tokens"]):
-        return False
-    if not _contains_all(text, row_cfg.get("must_all", [])):
-        return False
-    must_any = row_cfg.get("must_any", [])
-    if must_any and not _contains_any(text, must_any):
-        return False
-    if not _contains_none(text, row_cfg.get("block", [])):
-        return False
-    return True
-
-# =========================================================
+# ============================================================
 # 본문 추출
-# =========================================================
+# ============================================================
 def fetch_article_text(url: str, timeout: int = 20) -> str:
     if not url:
         return ""
-    # trafilatura 우선
-    if _HAS_TRAFILATURA:
-        try:
-            downloaded = trafilatura.fetch_url(url, no_ssl=True, timeout=timeout)
-            if downloaded:
-                text = trafilatura.extract(
-                    downloaded,
-                    include_comments=False,
-                    include_tables=False,
-                    include_formatting=False,
-                    favor_recall=True,
-                    deduplicate=True,
-                ) or ""
-                if text:
-                    return text.strip()
-        except Exception:
-            pass
-    # 폴백: requests + HTML 제거
+    try:
+        downloaded = trafilatura.fetch_url(url, no_ssl=True, timeout=timeout)
+        if downloaded:
+            text = trafilatura.extract(
+                downloaded,
+                include_comments=False,
+                include_tables=False,
+                include_formatting=False,
+                favor_recall=True,
+                deduplicate=True,
+            ) or ""
+            return text.strip()
+    except Exception:
+        pass
+
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
@@ -265,9 +215,9 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
     except Exception:
         return ""
 
-# =========================================================
-# 검색기
-# =========================================================
+# ============================================================
+# 뉴스 검색기
+# ============================================================
 def search_naver(query: str, display: int = 20) -> list[dict]:
     cid = os.environ.get("NAVER_CLIENT_ID", "")
     csec = os.environ.get("NAVER_CLIENT_SECRET", "")
@@ -308,8 +258,8 @@ def search_newsapi(query: str, window_from_utc: datetime, window_to_utc: datetim
     endpoint = "https://newsapi.org/v2/everything"
     params = {
         "q": f"{query}",
-        "from": window_from_utc.isoformat().replace("+00:00", "Z"),
-        "to": window_to_utc.isoformat().replace("+00:00", "Z"),
+        "from": window_from_utc.isoformat().replace("+00:00","Z"),
+        "to": window_to_utc.isoformat().replace("+00:00","Z"),
         "sortBy": "publishedAt",
         "pageSize": 50,
         "language": language,
@@ -339,197 +289,255 @@ def search_newsapi(query: str, window_from_utc: datetime, window_to_utc: datetim
     except Exception:
         return []
 
-# =========================================================
-# 컨텍스트 분석 & 규칙 라벨
-# =========================================================
+# ============================================================
+# 관련성 필터(시트 규칙)
+# ============================================================
+def _contains_all(text: str, toks: list[str]) -> bool:
+    return all(t in text for t in toks) if toks else True
+
+def _contains_any(text: str, toks: list[str]) -> bool:
+    return any(t in text for t in toks) if toks else True
+
+def _contains_none(text: str, toks: list[str]) -> bool:
+    return all(t not in text for t in toks) if toks else True
+
+def is_relevant_by_rule(row_cfg: dict, title: str, summary: str) -> bool:
+    text = f"{title} {summary}".lower()
+    if row_cfg.get("query_tokens") and not _contains_any(text, row_cfg["query_tokens"]):
+        return False
+    if not _contains_all(text, row_cfg.get("must_all", [])):
+        return False
+    must_any = row_cfg.get("must_any", [])
+    if must_any and not _contains_any(text, must_any):
+        return False
+    if not _contains_none(text, row_cfg.get("block", [])):
+        return False
+    return True
+
+# ============================================================
+# 컨텍스트 신호 분석 + 규칙 라벨
+# ============================================================
+def _is_org_related_context(text: str, keywords: list[str], org_name: str) -> bool:
+    if not org_name:
+        return False
+    org_positions = [m.start() for m in re.finditer(re.escape(org_name), text)]
+    for kw in keywords:
+        for kp in [m.start() for m in re.finditer(re.escape(kw), text)]:
+            for op in org_positions:
+                if abs(op - kp) <= 100:
+                    return True
+    return False
+
 def analyze_context_signals(title: str, summary: str, content: str, org_name: str) -> dict:
-    text = f"{title} {summary} {content}".lower()
+    full = f"{title} {summary} {content}".lower()
     org_lower = org_name.lower()
-    org_involvement = "direct" if org_lower in text else "indirect"
+    org_direct = org_lower in full
 
     signals = {
-        "direct": [],
-        "context": [],
-        "mon": [],
-        "pos": [],
-        "org": org_involvement,
-        "score": 0,
-        "conf": 0.5,
+        "direct_negative": [],
+        "contextual_negative": [],
+        "monitoring": [],
+        "positive": [],
+        "org_involvement": "direct" if org_direct else "indirect",
+        "severity_score": 0,
+        "confidence": 0.5,
     }
 
-    # 직접 부정: 높은 가중치
-    for category, kws in DIRECT_NEGATIVE.items():
-        found = [kw for kw in kws if kw in text]
+    for cat, kws in DIRECT_NEGATIVE.items():
+        found = [kw for kw in kws if kw in full]
         if found:
-            signals["direct"].extend((category, kw) for kw in found)
-            signals["score"] += 3 * len(found)
+            signals["direct_negative"].extend([(cat, kw) for kw in found])
+            signals["severity_score"] += len(found) * 3
 
-    # 상황 부정: 조직 연관성에 따라 가중치
-    for category, kws in CONTEXTUAL_NEGATIVE.items():
-        found = [kw for kw in kws if kw in text]
+    for cat, kws in CONTEXTUAL_NEGATIVE.items():
+        found = [kw for kw in kws if kw in full]
         if found:
-            weight = 2 if org_involvement == "direct" else 1
-            signals["context"].extend((category, kw) for kw in found)
-            signals["score"] += weight * len(found)
+            weight = 2 if _is_org_related_context(full, found, org_lower) else 1
+            signals["contextual_negative"].extend([(cat, kw) for kw in found])
+            signals["severity_score"] += len(found) * weight
 
-    # 모니터링
-    for category, kws in MONITORING_KEYWORDS.items():
-        found = [kw for kw in kws if kw in text]
+    for cat, kws in MONITORING_KEYWORDS.items():
+        found = [kw for kw in kws if kw in full]
         if found:
-            signals["mon"].extend((category, kw) for kw in found)
-            signals["score"] += 1 * len(found)
+            signals["monitoring"].extend([(cat, kw) for kw in found])
+            signals["severity_score"] += len(found) * 1
 
-    # 긍정: 점수 차감
-    for category, kws in POSITIVE_KEYWORDS.items():
-        found = [kw for kw in kws if kw in text]
+    for cat, kws in POSITIVE_KEYWORDS.items():
+        found = [kw for kw in kws if kw in full]
         if found:
-            signals["pos"].extend((category, kw) for kw in found)
-            signals["score"] -= 1 * len(found)
+            signals["positive"].extend([(cat, kw) for kw in found])
+            signals["severity_score"] -= len(found) * 1
 
-    total = len(signals["direct"]) + len(signals["context"]) + len(signals["mon"]) + len(signals["pos"])
-    if total:
-        signals["conf"] = (min(0.9, 0.5 + 0.1 * total)
-                           if org_involvement == "direct"
-                           else min(0.7, 0.3 + 0.05 * total))
+    total = (len(signals["direct_negative"]) + len(signals["contextual_negative"]) +
+             len(signals["monitoring"]) + len(signals["positive"]))
+    if total > 0:
+        if signals["org_involvement"] == "direct":
+            signals["confidence"] = min(0.9, 0.5 + total * 0.1)
+        else:
+            signals["confidence"] = min(0.7, 0.3 + total * 0.05)
     return signals
 
-def rule_label_from_signals(sig: dict) -> str:
-    if sig["direct"] and sig["conf"] > 0.6:
+def enhanced_rule_label(signals: dict) -> str:
+    score = signals["severity_score"]
+    conf  = signals["confidence"]
+
+    if signals["direct_negative"] and conf > 0.6:
         return "🔴"
-    if sig["context"] and sig["org"] == "direct" and sig["score"] > 4:
+    if signals["contextual_negative"] and signals["org_involvement"] == "direct" and score > 4:
         return "🔴"
-    if sig["mon"] and sig["score"] > 2:
+    if signals["monitoring"] and score > 2:
         return "🟡"
-    if sig["pos"] and sig["score"] < 0:
+    if signals["positive"] and score < 0:
         return "🔵"
-    if sig["score"] <= 2:
+    if score <= 2:
         return "🟢"
     return "🟡"
 
-# =========================================================
-# LLM 라벨링
-# =========================================================
+# ============================================================
+# LLM 라벨러 (개선 프롬프트)
+# ============================================================
+IMPACT_MAP = {"positive": "🔵", "neutral": "🟢", "monitor": "🟡", "negative": "🔴"}
+
+def _format_signals_for_llm(s: dict) -> str:
+    parts = []
+    if s["direct_negative"]:
+        parts.append(f"직접부정:{', '.join([kw for _, kw in s['direct_negative']])}")
+    if s["contextual_negative"]:
+        parts.append(f"상황부정:{', '.join([kw for _, kw in s['contextual_negative']])}")
+    if s["monitoring"]:
+        parts.append(f"모니터링:{', '.join([kw for _, kw in s['monitoring']])}")
+    if s["positive"]:
+        parts.append(f"긍정:{', '.join([kw for _, kw in s['positive']])}")
+    parts.append(f"연관성:{s['org_involvement']}")
+    parts.append(f"위험도:{s['severity_score']}")
+    return " | ".join(parts) if parts else "특별한 신호 없음"
+
+def _safe_load_json(s: str):
+    try:
+        s = re.sub(r'```json\s*|\s*```', '', s)
+        return json.loads(s)
+    except Exception:
+        try:
+            m = re.search(r'\{[^}]*"impact"\s*:\s*"([^"]+)"[^}]*\}', s)
+            if m:
+                return {"impact": m.group(1), "confidence": 0.5}
+        except Exception:
+            pass
+        return None
+
 def llm_enabled() -> bool:
     flag = os.environ.get("LLM_ENABLE", "").strip().lower()
-    return (flag in {"1", "true", "yes", "on"}) and bool(os.environ.get("OPENAI_API_KEY", "")) and _HAS_OPENAI
+    enabled = flag in {"1", "true", "yes", "on"}
+    return enabled and bool(os.environ.get("OPENAI_API_KEY", "").strip()) and _HAS_OPENAI
 
-def _format_signals_for_llm(sig: dict) -> str:
-    parts = []
-    if sig["direct"]:
-        parts.append("직접부정: " + ", ".join(kw for _, kw in sig["direct"]))
-    if sig["context"]:
-        parts.append("상황부정: " + ", ".join(kw for _, kw in sig["context"]))
-    if sig["mon"]:
-        parts.append("모니터링: " + ", ".join(kw for _, kw in sig["mon"]))
-    if sig["pos"]:
-        parts.append("긍정: " + ", ".join(kw for _, kw in sig["pos"]))
-    parts.append(f"조직연관성: {sig['org']} / 위험점수: {sig['score']}")
-    return " | ".join(parts)
-
-def enhanced_llm_label(display: str, title: str, summary: str, content: str, sig: dict) -> dict | None:
+def enhanced_llm_label(display_name: str, title: str, summary: str, content: str, signals: dict) -> dict | None:
     if not llm_enabled():
         return None
 
     body = (content or "").strip()
     if len(body) > 4000:
         body = body[:4000]
-    signal_text = _format_signals_for_llm(sig)
-
-    prompt = f"""
-당신은 기업 위기관리 전문 분석가입니다. 다음 뉴스가 '{display}'에 미치는 영향을 평가하세요.
-
-[판단기준]
-- positive(🔵): 명확한 긍정 영향(수상, 투자, 협력, 후원 등)
-- neutral(🟢): 영향 적음(업계 일반 동향, 단순 언급)
-- monitor(🟡): 주의 필요(조사/불확실/잠재 리스크)
-- negative(🔴): 명확한 부정 영향(법적 문제, 사고, 사업 타격)
-
-[원칙]
-- 강한 부정 키워드가 있어도 '{display}'와 직접 관련 없으면 부정으로 판단하지 말 것
-- 추측 금지, 기사 내용 기반 판단
-- 애매하면 monitor
-
-[조직] {display}
-[제목] {title}
-[요약] {summary or "없음"}
-[본문(일부)] {body}
-[자동 분석 신호] {signal_text}
-
-JSON 응답만 출력:
-{{
-  "impact": "positive|neutral|monitor|negative",
-  "confidence": 0.0-1.0,
-  "primary_reason": "주요 판단 근거",
-  "evidence": ["근거1","근거2"],
-  "org_relevance": "direct|indirect|minimal"
-}}
-"""
+    signal_summary = _format_signals_for_llm(signals)
 
     try:
         client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+        prompt = f"""당신은 기업 위기관리 분석가입니다. 아래 기사가 조직에 미치는 '영향'만 평가하세요.
+
+평가 기준:
+- positive(🔵): 명확한 긍정적 영향 (수상/투자/계약/협력/사회공헌 등)
+- neutral(🟢): 중립 또는 영향 미미 (업계 동향, 단순 언급 등)
+- monitor(🟡): 주의 필요 (조사/검토/불확실/잠재 리스크)
+- negative(🔴): 명확한 부정 (법적 문제/사고/직접 비판/사업 타격)
+
+원칙:
+1) 조직이 주요 대상인지(직접) vs 단순 언급(간접) 구분
+2) 기사에 명시된 사실에 기반, 과도한 추정 금지
+3) 산업 일반론보다 조직 직접 영향 우선
+4) 애매하면 보수적(🟡)이되, 명백한 호재는 positive
+
+조직: {display_name}
+제목: {title}
+요약: {summary or "없음"}
+
+본문(일부):
+{body}
+
+자동 분석 요약:
+{signal_summary}
+
+JSON으로만 응답:
+{{
+  "impact": "positive|neutral|monitor|negative",
+  "confidence": 0.0-1.0,
+  "primary_reason": "주요 판단 근거 한 줄",
+  "evidence": ["근거1","근거2"],
+  "org_relevance": "direct|indirect|minimal"
+}}"""
+
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=320,
+            max_tokens=300,
         )
         raw = (resp.choices[0].message.content or "").strip()
-        raw = re.sub(r"```json\s*|\s*```", "", raw)  # 코드블록 제거
-        data = json.loads(raw)
-
-        im = str(data.get("impact", "")).lower()
-        if im not in {"positive", "neutral", "monitor", "negative"}:
+        data = _safe_load_json(raw)
+        if not data or "impact" not in data:
             return None
-        label_map = {"positive": "🔵", "neutral": "🟢", "monitor": "🟡", "negative": "🔴"}
+
+        impact = str(data.get("impact", "")).lower()
+        if impact not in IMPACT_MAP:
+            return None
+        conf = float(data.get("confidence", 0.5))
         return {
-            "label": label_map[im],
-            "confidence": float(data.get("confidence", 0.5)),
-            "primary_reason": data.get("primary_reason", ""),
-            "org_relevance": data.get("org_relevance", ""),
+            "label": IMPACT_MAP[impact],
+            "confidence": conf,
             "raw": data,
+            "primary_reason": data.get("primary_reason", ""),
+            "org_relevance": data.get("org_relevance", "unknown"),
         }
     except Exception as e:
         logging.error(f"LLM labeling failed: {e}")
         return None
 
-# =========================================================
+# ============================================================
 # 통합 라벨링
-# =========================================================
-def integrated_labeling(display: str, title: str, summary: str, content: str) -> dict:
-    sig = analyze_context_signals(title, summary, content, display)
-    rule = rule_label_from_signals(sig)
-    llm = enhanced_llm_label(display, title, summary, content, sig)
+# ============================================================
+def integrated_labeling(display_name: str, title: str, summary: str, content: str) -> dict:
+    signals = analyze_context_signals(title, summary, content, display_name)
+    rule_label = enhanced_rule_label(signals)
+    llm_result = enhanced_llm_label(display_name, title, summary, content, signals)
 
-    out = {
-        "label": rule,
-        "confidence": sig["conf"],
-        "method": "rule",
-        "signals": sig,
-        "llm": llm,
+    result = {
+        "label": rule_label,
+        "confidence": signals["confidence"],
+        "method": "rule_based",
+        "signals": signals,
+        "llm_result": llm_result,
     }
 
-    # LLM 신뢰 가능하면 우선 적용
-    if llm and llm["confidence"] > 0.6:
-        # 직접 부정이 뚜렷한데 LLM이 🟢/🔵 → 보수적 오버라이드
-        if sig["direct"] and llm["label"] in {"🟢", "🔵"} and sig["org"] == "direct":
-            out["label"] = "🔴"
-            out["method"] = "conservative_override"
+    if llm_result and llm_result["confidence"] > 0.6:
+        # 직접부정이 있는데 LLM이 긍정/중립이면 보수적
+        if signals["direct_negative"] and llm_result["label"] in {"🟢", "🔵"} and signals["org_involvement"] == "direct":
+            result["label"] = "🔴"
+            result["method"] = "conservative_override"
         else:
-            out["label"] = llm["label"]
-            out["confidence"] = llm["confidence"]
-            out["method"] = "llm"
+            result["label"] = llm_result["label"]
+            result["confidence"] = llm_result["confidence"]
+            result["method"] = "llm_primary"
 
-    # 과도한 🔴 완화: 직접 부정 없고 점수 낮을때
-    if out["label"] == "🔴" and not sig["direct"] and sig["score"] < 5:
-        out["label"] = "🟡"
-        out["method"] += "_moderated"
+    # 과도한 🔴 방지
+    if result["label"] == "🔴" and not signals["direct_negative"] and signals["severity_score"] < 5:
+        result["label"] = "🟡"
+        result["method"] += "_moderated"
 
-    return out
+    return result
 
-# =========================================================
+# ============================================================
 # Slack
-# =========================================================
+# ============================================================
 def post_to_slack(lines: list[str]) -> None:
     token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
     channel = os.environ.get("SLACK_CHANNEL", "").strip()
@@ -539,13 +547,13 @@ def post_to_slack(lines: list[str]) -> None:
     text = "\n".join(lines) if lines else "오늘은 신규로 감지된 기사가 없습니다."
     client.chat_postMessage(channel=channel, text=text)
 
-# =========================================================
-# 메인
-# =========================================================
+# ============================================================
+# main
+# ============================================================
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    # 주말 스킵(이중 안전장치)
+    # 주말 스킵
     if now_kst().weekday() in (5, 6):
         logging.info("Weekend (Sat/Sun) – skipping run.")
         return
@@ -556,13 +564,12 @@ def main() -> None:
     rows = fetch_org_list()
     logging.info("Loaded %d targets.", len(rows))
 
-    # 캐시: 같은 기사(제목+본문) 재분석 방지
     analysis_cache: dict[str, dict] = {}
     all_lines: list[str] = []
 
     for idx, row in enumerate(rows, start=1):
         display = row["display"]
-        query = row["query"]
+        query   = row["query"]
         logging.info("(%d/%d) Searching: %s | %s", idx, len(rows), display, query)
 
         naver_items = search_naver(query, display=20)
@@ -576,7 +583,7 @@ def main() -> None:
             it["row_cfg"] = row
             items.append(it)
 
-        # 1) 관련성 필터
+        # 1) 시트 규칙 관련성
         before_rel = len(items)
         items = [it for it in items if is_relevant_by_rule(it["row_cfg"], it["title"], it.get("summary", ""))]
         logging.info("  after relevance: %d -> %d", before_rel, len(items))
@@ -586,61 +593,66 @@ def main() -> None:
         items = [it for it in items if it["published_at"] and window_from_utc <= it["published_at"] < window_to_utc]
         logging.info("  after window: %d -> %d", before_win, len(items))
 
-        # 3) 최신순 + 제목 기준 dedup (도메인 무관)
+        # 3) 최신순 + 제목 중복 제거 (예외 조직은 제거하지 않음)
         items.sort(key=lambda x: x["published_at"], reverse=True)
-        seen_titles = set(); uniq = []
+        seen_titles = set()
+        uniq = []
         for it in items:
-            tk = norm_title(it["title"])
-            if tk and it["url"] and tk not in seen_titles:
-                uniq.append(it); seen_titles.add(tk)
+            title_key = norm_title(it["title"])
+            if not title_key or not it["url"]:
+                continue
+            if it["display"] in DEDUP_EXEMPT_ORGS:
+                # 예외 조직: 중복 허용
+                uniq.append(it)
+            else:
+                if title_key not in seen_titles:
+                    uniq.append(it)
+                    seen_titles.add(title_key)
 
-        # 4) 라벨링
+        # 4) 통합 라벨링
         for art in uniq:
             content = fetch_article_text(art["url"])
-
-            # 캐시 체크
-            ck = content_hash(art["title"], content)
-            if ck in analysis_cache:
-                result = analysis_cache[ck].copy()
+            cache_key = content_hash(art["title"], content)
+            if cache_key in analysis_cache:
+                result = analysis_cache[cache_key].copy()
                 logging.info("  Cache hit: %s", art["title"][:60])
             else:
                 result = integrated_labeling(art["display"], art["title"], art.get("summary", ""), content)
-                analysis_cache[ck] = result
-                logging.info("  Analyzed: %s -> %s (method=%s, conf=%.2f)",
+                analysis_cache[cache_key] = result
+                logging.info("  Analyzed: %s -> %s (%s, conf=%.2f)",
                              art["title"][:60], result["label"], result["method"], result["confidence"])
 
-            # Slack 라인 생성
             label = result["label"]
-            conf = result["confidence"]
-            conf_mark = "!" if conf > 0.8 else ("?" if conf < 0.5 else "")
+            confidence = result["confidence"]
+            method = result["method"]
+
+            conf_mark = "!" if confidence > 0.8 else ("?" if confidence < 0.5 else "")
             src = art["source"]
             when_str = to_kst_str(art["published_at"])
 
-            extra = []
-            llm = result.get("llm") or {}
-            if llm.get("primary_reason"):
-                extra.append(f"이유:{llm['primary_reason']}")
+            extra_info = []
+            if result.get("llm_result", {}).get("primary_reason"):
+                extra_info.append(f"이유: {result['llm_result']['primary_reason']}")
             sig = result.get("signals", {})
-            if sig.get("direct"):
-                extra.append(f"직접위험:{len(sig['direct'])}")
-            if sig.get("pos"):
-                extra.append(f"긍정신호:{len(sig['pos'])}")
+            if sig.get("direct_negative"):
+                extra_info.append(f"직접위험:{len(sig['direct_negative'])}")
+            if sig.get("positive"):
+                extra_info.append(f"긍정신호:{len(sig['positive'])}")
+            extra = f" ({', '.join(extra_info)})" if extra_info else ""
 
-            extra_txt = f" ({', '.join(extra)})" if extra else ""
-            line = f"[{art['display']}] <{art['url']}|{art['title']}> ({src})({when_str}) [{label}{conf_mark}]{extra_txt}"
+            line = f"[{art['display']}] <{art['url']}|{art['title']}> ({src})({when_str}) [{label}{conf_mark}]{extra}"
             all_lines.append(line)
 
-    # 결과 라벨 분포 로그
-    counts = defaultdict(int)
-    for ln in all_lines:
-        for emo in ("🔴", "🟡", "🟢", "🔵"):
-            if emo in ln:
-                counts[emo] += 1
+    # 요약 로깅
+    label_counts = defaultdict(int)
+    for line in all_lines:
+        for emoji in ["🔴", "🟡", "🟢", "🔵"]:
+            if emoji in line:
+                label_counts[emoji] += 1
                 break
     logging.info("Label distribution: 🔴%d 🟡%d 🟢%d 🔵%d",
-                 counts["🔴"], counts["🟡"], counts["🟢"], counts["🔵"])
+                 label_counts["🔴"], label_counts["🟡"], label_counts["🟢"], label_counts["🔵"])
 
-    # Slack 전송
     post_to_slack(all_lines)
     logging.info("Posted %d lines to Slack.", len(all_lines))
 
